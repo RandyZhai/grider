@@ -4,6 +4,7 @@ global:
 
 # 外部API提供商配置
 providers:
+  # ==================== 沧海数据（商业API，备用）====================
   tsanghi:
     name: "沧海数据API"
     base_url: "https://www.tsanghi.com/api"
@@ -93,7 +94,44 @@ providers:
           - token: "{TSANGHI_TOKEN_01}"
             priority: 2
 
-
-
+  # ==================== AKShare（开源免费，主要数据源）====================
+  # Verified: 2026-09-08
+  # Data Sources: 腾讯 (Tencent) + 新浪 (Sina)
+  # Documentation: openspec/data-spec.md
+  akshare:
+    name: "AKShare开源数据 (新浪/腾讯)"
+    enabled: true
+    priority: 1  # 高于tsanghi，作为主要数据源
+    
+    # 数据源优先级（已验证）
+    source_preference:
+      - tencent   # ✅ PRIMARY: 无IP限制，数据质量高
+      - sina      # ⚠️ SECONDARY: ETF、日历、复权因子（需限流）
+    
+    # 限流配置
+    # 注意：腾讯无官方限制，但仍需礼貌访问；新浪易触发IP封禁
+    rate_limit:
+      tencent_requests_per_second: 10  # 腾讯：宽松限制
+      sina_requests_per_second: 1     # 新浪：严格限制（避免封禁）
+      burst: 5
+    
+    # 缓存配置（秒）
+    cache:
+      realtime_ttl: 60         # 实时数据：1分钟
+      daily_ttl: 86400         # 日线数据：1天
+      etf_daily_ttl: 86400     # ETF日线：1天
+      calendar_ttl: 2592000    # 交易日历：30天（很少变化）
+      factor_ttl: 2592000      # 复权因子：30天（很少变化）
+    
+    # 重试配置
+    retry:
+      max_attempts: 3
+      backoff_seconds: 1
+      backoff_multiplier: 2  # 指数退避
+    
+    # Docker环境特定设置
+    docker:
+      timeout_seconds: 30     # 请求超时
+      user_agent: "Mozilla/5.0 (compatible; GriderBot/1.0)"
   
 

@@ -54,7 +54,7 @@ EXPOSE 5000
 
 # 复制启动脚本
 COPY deploy/entrypoint.sh ./
-RUN chmod +x entrypoint.sh
+RUN chmod +x entrypoint.sh && sed -i 's/\r$//' entrypoint.sh
 
 # 创建日志目录
 RUN mkdir -p /app/backend/logs && chown -R app:app /app/backend/logs
