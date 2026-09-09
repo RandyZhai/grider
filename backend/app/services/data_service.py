@@ -172,35 +172,48 @@ class DataService:
             logger.error(f"清除缓存失败: {e}")
             raise
 
+    def _fetch_5min_response(self, provider, sec_type: str, ticker: str,
+                              exchange_code: str, start_date: str, end_date: str) -> dict:
+        """调用指定 provider 的 5 分钟K线接口"""
+        if sec_type == 'ETF':
+            return provider.get_etf_5min(ticker, exchange_code, start_date, end_date)
+        elif sec_type == 'STOCK':
+            return provider.get_stock_5min(ticker, exchange_code, start_date, end_date)
+        else:
+            raise ValueError(f"不支持的证券类型: {sec_type}")
+
     def get_5min_kline(self, ticker: str, exchange_code: str,
                         start_date: str, end_date: str, type: str = 'STOCK') -> List[KBar]:
         """
         获取5分钟K线数据
 
-        注意：AKShare暂不支持5分钟K线，将回退到Tsanghi或返回空列表
+        优先使用当前数据源（akshare 新浪分钟接口，免费、覆盖最近约40个交易日）；
+        当前数据源不可用时回退到 Tsanghi（需配置 TSANGHI_TOKEN，支持更长周期）。
         """
         try:
-            # 如果当前是AKShare且没有5分钟接口，尝试切换到Tsanghi
-            if self.provider_name == 'akshare' and 'tsanghi' in self._providers:
-                logger.debug("AKShare不支持5分钟K线，尝试使用Tsanghi")
-                tsanghi = self._providers['tsanghi']
-                
-                if type == 'ETF':
-                    response = tsanghi.get_etf_5min(ticker, exchange_code, start_date, end_date)
-                elif type == 'STOCK':
-                    response = tsanghi.get_stock_5min(ticker, exchange_code, start_date, end_date)
-                else:
-                    raise ValueError(f"不支持的证券类型: {type}")
-            else:
-                # 使用当前provider
-                if type == 'ETF':
-                    response = self.provider.get_etf_5min(ticker, exchange_code, start_date, end_date)
-                elif type == 'STOCK':
-                    response = self.provider.get_stock_5min(ticker, exchange_code, start_date, end_date)
-                else:
-                    raise ValueError(f"不支持的证券类型: {type}")
+            # 1. 优先使用当前数据源
+            response = None
+            try:
+                response = self._fetch_5min_response(
+                    self.provider, type, ticker, exchange_code, start_date, end_date
+                )
+            except Exception as e:
+                logger.warning(f"数据源[{self.provider_name}]获取5分钟K线异常: {e}")
+                response = None
 
-            if response.get('code') == 200 and 'data' in response:
+            # 2. 当前数据源无数据时，回退到 Tsanghi（显式使用 tsanghi 时除外）
+            if (not response or response.get('code') != 200 or not response.get('data')) \
+                    and 'tsanghi' in self._providers and self.provider_name != 'tsanghi':
+                logger.info("当前数据源5分钟K线不可用，回退到 Tsanghi")
+                try:
+                    response = self._fetch_5min_response(
+                        self._providers['tsanghi'], type, ticker,
+                        exchange_code, start_date, end_date
+                    )
+                except Exception as e:
+                    logger.warning(f"Tsanghi 获取5分钟K线失败（未配置 token?）: {e}")
+
+            if response and response.get('code') == 200 and response.get('data'):
                 data = response['data']
             else:
                 logger.warning(f"获取5分钟K线数据失败: {response}")
@@ -220,6 +233,14 @@ class DataService:
 
             # 按时间排序，确保从历史到现在的顺序
             kbars.sort(key=lambda k: k.time)
+
+            # 新浪分钟源仅覆盖最近约40个交易日，若请求起始日早于数据起点，提示数据被截断
+            if kbars and start_date and kbars[0].time.strftime('%Y-%m-%d') > start_date:
+                logger.warning(
+                    f"5分钟K线实际覆盖起始日为 {kbars[0].time.strftime('%Y-%m-%d')}，"
+                    f"早于该日期的数据缺失（请求起始日 {start_date}，新浪分钟源仅提供最近约40个交易日；"
+                    f"如需更长周期请配置 TSANGHI_TOKEN）"
+                )
 
             return kbars
         except Exception as e:

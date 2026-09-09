@@ -11,7 +11,8 @@
   - ETF 历史日线: fund_etf_hist_sina
   - 股票历史日线: stock_zh_a_daily
   - 交易日历: tool_trade_date_hist_sina
-  - 5 分钟 K 线: stock_zh_a_hist_min_ths / fund_etf_hist_min_ths (1.18.94 已移除，由 DataService 回退到 Tsanghi)
+  - 5 分钟 K 线: stock_zh_a_minute (新浪分钟接口，ETF/股票通用，免费无需 token，
+    返回最近约 1970 根 bar，5 分钟周期约覆盖 40 个交易日；更长周期由 DataService 回退 Tsanghi)
 """
 
 import hashlib
@@ -149,6 +150,46 @@ class AkshareProvider:
         df = df.copy()
         df['pre_close'] = df['close'].shift(1)
         df['pre_close'] = df['pre_close'].fillna(df['close'].iloc[0])
+        return df
+
+    def _get_sina_minute_df(self, ticker: str, period: str = '5') -> Optional[pd.DataFrame]:
+        """获取新浪分钟K线 (stock_zh_a_minute，ETF/股票代码均适用)
+
+        新浪源免费、无需 token；返回最近约 1970 根 bar（5 分钟周期约 40 个交易日）。
+        """
+        sina_symbol = self._to_sina_symbol(ticker)
+        attempts = 3
+        for i in range(attempts):
+            try:
+                df = ak.stock_zh_a_minute(symbol=sina_symbol, period=period, adjust='')
+                if df is not None and not df.empty:
+                    return df
+            except Exception as e:
+                logger.warning(f"akshare 新浪分钟行情第 {i+1} 次尝试失败: {ticker}, {e}")
+                time.sleep(0.5 * (i + 1))
+        return None
+
+    def _filter_minute_by_date(self, df: pd.DataFrame, start_date: str = "",
+                                end_date: str = "") -> pd.DataFrame:
+        """按日期过滤分钟线 (date 列格式为 'YYYY-MM-DD HH:MM:SS')"""
+        if df is None or df.empty:
+            return df
+        day = df['date'].astype(str).str[:10]
+        if start_date:
+            df = df[day >= start_date[:10]]
+            day = df['date'].astype(str).str[:10]
+        if end_date:
+            df = df[day <= end_date[:10]]
+        return df
+
+    def _normalize_minute_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        """新浪分钟线列名/类型标准化: day -> date，数值列转 float"""
+        df = df.rename(columns={'day': 'date'})
+        if 'date' in df.columns:
+            df['date'] = df['date'].astype(str)
+        for col in ['open', 'high', 'low', 'close', 'volume', 'amount']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
         return df
 
     def _get_stock_realtime_df(self) -> pd.DataFrame:
@@ -297,7 +338,10 @@ class AkshareProvider:
 
     def get_etf_5min(self, ticker: str, exchange_code: str = "XSHG",
                       start_date: str = "", end_date: str = "") -> dict:
-        """获取ETF历史5分钟行情 (同花顺 ths 接口，akshare 1.18.94 已移除)"""
+        """获取ETF历史5分钟行情 (新浪 stock_zh_a_minute，免费无需 token)
+
+        注：新浪源仅提供最近约 40 个交易日的分钟数据；更长周期需配置 Tsanghi token。
+        """
         cache_params = {
             'ticker': ticker, 'start_date': start_date, 'end_date': end_date,
         }
@@ -306,39 +350,16 @@ class AkshareProvider:
             return cached
 
         try:
-            sd = f"{start_date} 09:30:00" if start_date else '2020-01-01 09:30:00'
-            ed = f"{end_date} 15:00:00" if end_date else datetime.now().strftime('%Y-%m-%d 15:00:00')
-
-            df = None
-            if hasattr(ak, 'fund_etf_hist_min_ths'):
-                attempts = 3
-                for i in range(attempts):
-                    try:
-                        df = ak.fund_etf_hist_min_ths(symbol=ticker, period='5',
-                                                       start_date=sd, end_date=ed)
-                        break
-                    except Exception as e:
-                        logger.warning(f"akshare 获取ETF 5分钟行情第 {i+1} 次尝试失败: {ticker}, {e}")
-                        time.sleep(0.5 * (i + 1))
-                        df = None
-            else:
-                logger.warning("当前 akshare 版本无 fund_etf_hist_min_ths 接口，DataService 将回退到 Tsanghi")
-
+            df = self._get_sina_minute_df(ticker, period='5')
             if df is None or df.empty:
                 return {'code': 500, 'data': [], 'message': '无法获取分钟线数据'}
 
-            mapping = {
-                '时间': 'date', '开盘': 'open', '最高': 'high',
-                '最低': 'low', '收盘': 'close', '成交量': 'volume',
-                '成交额': 'amount',
-            }
-            if 'date' not in df.columns:
-                df = df.rename(columns=mapping)
-            if 'date' in df.columns:
-                df['date'] = df['date'].astype(str)
-            for col in ['open', 'high', 'low', 'close', 'volume', 'amount']:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
+            df = self._normalize_minute_df(df)
+            df = self._filter_minute_by_date(df, start_date, end_date)
+            if df is None or df.empty:
+                return {'code': 404, 'data': [],
+                        'message': '所选日期范围无分钟线数据（新浪源仅提供最近约40个交易日）'}
+
             result = {'code': 200, 'data': self._df_to_list(df)}
             self.cache.set('etf_5min', cache_params, result, 3600)
             return result
@@ -430,7 +451,10 @@ class AkshareProvider:
 
     def get_stock_5min(self, ticker: str, exchange_code: str = "XSHG",
                         start_date: str = "", end_date: str = "") -> dict:
-        """获取股票历史5分钟行情 (同花顺 ths 接口，akshare 1.18.94 已移除)"""
+        """获取股票历史5分钟行情 (新浪 stock_zh_a_minute，免费无需 token)
+
+        注：新浪源仅提供最近约 40 个交易日的分钟数据；更长周期需配置 Tsanghi token。
+        """
         cache_params = {
             'ticker': ticker, 'start_date': start_date, 'end_date': end_date,
         }
@@ -439,39 +463,16 @@ class AkshareProvider:
             return cached
 
         try:
-            sd = f"{start_date} 09:30:00" if start_date else '2020-01-01 09:30:00'
-            ed = f"{end_date} 15:00:00" if end_date else datetime.now().strftime('%Y-%m-%d 15:00:00')
-
-            df = None
-            if hasattr(ak, 'stock_zh_a_hist_min_ths'):
-                attempts = 3
-                for i in range(attempts):
-                    try:
-                        df = ak.stock_zh_a_hist_min_ths(symbol=ticker, period='5',
-                                                        start_date=sd, end_date=ed, adjust='')
-                        break
-                    except Exception as e:
-                        logger.warning(f"akshare 获取股票5分钟行情第 {i+1} 次尝试失败: {ticker}, {e}")
-                        time.sleep(0.5 * (i + 1))
-                        df = None
-            else:
-                logger.warning("当前 akshare 版本无 stock_zh_a_hist_min_ths 接口，DataService 将回退到 Tsanghi")
-
+            df = self._get_sina_minute_df(ticker, period='5')
             if df is None or df.empty:
                 return {'code': 500, 'data': [], 'message': '无法获取分钟线数据'}
 
-            mapping = {
-                '时间': 'date', '开盘': 'open', '最高': 'high',
-                '最低': 'low', '收盘': 'close', '成交量': 'volume',
-                '成交额': 'amount',
-            }
-            if 'date' not in df.columns:
-                df = df.rename(columns=mapping)
-            if 'date' in df.columns:
-                df['date'] = df['date'].astype(str)
-            for col in ['open', 'high', 'low', 'close', 'volume', 'amount']:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
+            df = self._normalize_minute_df(df)
+            df = self._filter_minute_by_date(df, start_date, end_date)
+            if df is None or df.empty:
+                return {'code': 404, 'data': [],
+                        'message': '所选日期范围无分钟线数据（新浪源仅提供最近约40个交易日）'}
+
             result = {'code': 200, 'data': self._df_to_list(df)}
             self.cache.set('stock_5min', cache_params, result, 3600)
             return result
